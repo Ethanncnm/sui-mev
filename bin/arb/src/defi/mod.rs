@@ -13,7 +13,7 @@ mod turbos;
 mod utils;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     hash::Hash,
     sync::Arc,
@@ -166,22 +166,33 @@ impl Defi {
             return Ok(vec![Path::default()]);
         }
 
-        let mut all_hops = HashMap::new();
-        let mut stack = vec![coin_in_type.to_string()];
-        let mut visited = HashSet::new();
+        #[derive(Clone)]
+        struct SearchPath {
+            path: Vec<Box<dyn Dex>>,
+            next_coin: String,
+            min_liquidity: u128,
+        }
+
+        let mut queue = vec![SearchPath {
+            path: vec![],
+            next_coin: coin_in_type.to_string(),
+            min_liquidity: u128::MAX,
+        }];
         let mut visited_dexes = HashSet::new();
+        let mut results = vec![];
 
-        for nth_hop in 0..MAX_HOP_COUNT {
-            let is_last_hop = nth_hop == MAX_HOP_COUNT - 1;
-            let mut new_stack = vec![];
+        for hop in 0..MAX_HOP_COUNT {
+            let is_last = hop == MAX_HOP_COUNT - 1;
+            let mut next_queue = Vec::new();
 
-            while let Some(coin_type) = stack.pop() {
-                if visited.contains(&coin_type) || coin::is_native_coin(&coin_type) {
+            for search_path in queue.into_iter() {
+                let coin_type = search_path.next_coin.clone();
+                if coin::is_native_coin(&coin_type) {
+                    results.push(search_path.path);
                     continue;
                 }
-                visited.insert(coin_type.clone());
 
-                let coin_out_type = if pegged_coin_types().contains(coin_type.as_str()) || is_last_hop {
+                let coin_out_type = if pegged_coin_types().contains(coin_type.as_str()) || is_last {
                     Some(SUI_COIN_TYPE.to_string())
                 } else {
                     None
@@ -192,39 +203,41 @@ impl Defi {
                     continue;
                 };
 
-                dexes.retain(|dex| dex.liquidity() >= MIN_LIQUIDITY);
-
+                dexes.retain(|d| d.liquidity() >= MIN_LIQUIDITY);
                 if dexes.len() > MAX_POOL_COUNT {
-                    dexes.retain(|dex| !visited_dexes.contains(&dex.object_id()));
-                    dexes.sort_by_key(|dex| std::cmp::Reverse(dex.liquidity()));
+                    dexes.retain(|d| !visited_dexes.contains(&d.object_id()));
+                    dexes.sort_by_key(|d| std::cmp::Reverse(d.liquidity()));
                     dexes.truncate(MAX_POOL_COUNT);
                 }
 
-                if dexes.is_empty() {
-                    continue;
-                }
-
-                for dex in &dexes {
-                    let out_coin_type = dex.coin_out_type();
-                    if !visited.contains(&out_coin_type) {
-                        new_stack.push(out_coin_type.clone());
+                for dex in dexes {
+                    if visited_dexes.contains(&dex.object_id()) {
+                        continue;
                     }
                     visited_dexes.insert(dex.object_id());
+                    let mut new_path = search_path.path.clone();
+                    new_path.push(dex.clone());
+                    let next_coin = dex.coin_out_type();
+                    let min_liq = search_path.min_liquidity.min(dex.liquidity());
+                    next_queue.push(SearchPath { path: new_path, next_coin, min_liquidity: min_liq });
                 }
-                all_hops.insert(coin_type.clone(), dexes);
             }
 
-            if is_last_hop {
-                break;
-            }
-
-            stack = new_stack;
+            queue = next_queue;
         }
 
-        let mut routes = vec![];
-        dfs(coin_in_type, &mut vec![], &all_hops, &mut routes);
+        for sp in queue {
+            if coin::is_native_coin(&sp.next_coin) {
+                results.push(sp.path);
+            }
+        }
 
-        Ok(routes.into_iter().map(Path::new).collect())
+        results.sort_by_key(|path| {
+            let min_liq = path.iter().map(|d| d.liquidity()).min().unwrap_or(0);
+            std::cmp::Reverse(min_liq)
+        });
+
+        Ok(results.into_iter().map(Path::new).collect())
     }
 
     pub async fn find_buy_paths(&self, coin_out_type: &str) -> Result<Vec<Path>> {
@@ -311,28 +324,6 @@ impl Defi {
     }
 }
 
-fn dfs(
-    coin_type: &str,
-    path: &mut Vec<Box<dyn Dex>>,
-    hops: &HashMap<String, Vec<Box<dyn Dex>>>,
-    routes: &mut Vec<Vec<Box<dyn Dex>>>,
-) {
-    if coin::is_native_coin(coin_type) {
-        routes.push(path.clone());
-        return;
-    }
-    if path.len() >= MAX_HOP_COUNT {
-        return;
-    }
-    if !hops.contains_key(coin_type) {
-        return;
-    }
-    for dex in hops.get(coin_type).unwrap() {
-        path.push(dex.clone());
-        dfs(&dex.coin_out_type(), path, hops, routes);
-        path.pop();
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PathTradeResult {
